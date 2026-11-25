@@ -5,3 +5,4 @@
 | Лабораторная | Тема | Папка |
 |--------------|------|-------|
 | ЛР 1 | Dockerfile: плохой и хороший, volume | [`lab1/`](lab1/) |
+| ЛР 2 | Docker Compose: init + приложение + nginx, .env, сеть, healthcheck | [`lab2/`](lab2/) |
