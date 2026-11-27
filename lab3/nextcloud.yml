@@ -1,0 +1,306 @@
+# ============================================================================
+#  nextcloud.yml: всё для Nextcloud в одном файле
+# ============================================================================
+#
+#  ЧТО ТАКОЕ МАНИФЕСТ
+#
+#  Манифест это YAML-файл с описанием объектов, которые должны
+#  существовать в кластере Kubernetes. Kubernetes создаёт объекты по
+#  этому описанию и дальше следит, чтобы реальность ему соответствовала.
+#  Отступы в YAML делаются пробелами и определяют вложенность.
+#
+#  НЕСКОЛЬКО ОБЪЕКТОВ В ОДНОМ ФАЙЛЕ
+#
+#  Строка `---` разделяет YAML-документы. Каждый документ это отдельный
+#  объект. `kubectl create -f nextcloud.yml` создаст их все по порядку:
+#
+#    1. Secret    nextcloud-secret     пароль администратора Nextcloud
+#    2. ConfigMap nextcloud-configmap  остальные настройки Nextcloud
+#    3. Deployment nextcloud           сам Nextcloud с пробами
+#
+#  ЧТО ТАКОЕ NEXTCLOUD И КАК ОН СВЯЗАН С POSTGRES
+#
+#  Nextcloud это веб-сервис для хранения файлов (похож на Google Drive).
+#  Свои данные (пользователи, список файлов, настройки) он хранит в базе
+#  PostgreSQL. При первом запуске образ nextcloud сам устанавливает
+#  приложение: подключается к базе, создаёт таблицы и администратора.
+#
+#    браузер --> Service nextcloud --> под Nextcloud --> postgres-service --> под Postgres
+#
+#  Service для Nextcloud в этом файле не описан: его создаёт команда
+#      kubectl expose deployment nextcloud --type=NodePort --port=80
+#  (см. README, часть 3).
+#
+#  ЧТО ИЗМЕНЕНО ПО СРАВНЕНИЮ С ИСХОДНЫМ ПРИМЕРОМ
+#
+#    - переменные Nextcloud (NEXTCLOUD_UPDATE, ALLOW_EMPTY_PASSWORD,
+#      POSTGRES_HOST, NEXTCLOUD_TRUSTED_DOMAINS, NEXTCLOUD_ADMIN_USER)
+#      перенесены из Deployment в ConfigMap nextcloud-configmap;
+#    - POSTGRES_USER и POSTGRES_PASSWORD берутся из Secret postgres-secret,
+#      а не из ConfigMap (их перенесли туда в pg_secret.yml);
+#    - добавлены пробы: startupProbe, livenessProbe, readinessProbe;
+#    - в NEXTCLOUD_TRUSTED_DOMAINS добавлен localhost, он нужен пробе
+#      готовности (объяснение ниже, у readinessProbe).
+#
+#  КОМАНДЫ
+#
+#    kubectl create -f nextcloud.yml
+#    kubectl get secret,configmap,deployment,pods
+#    kubectl describe secret/nextcloud-secret    значения скрыты
+#    kubectl logs deployment/nextcloud           ход установки
+#    kubectl describe pod -l app=nextcloud       в Events видно срабатывание проб
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# 1. Secret: пароль администратора Nextcloud.
+#
+# Secret хранит пары "ключ: значение", как ConfigMap, но kubectl describe
+# не показывает его значения, а права на чтение Secret можно выдать
+# отдельно. Значения хранятся в base64: это кодировка, а не шифрование,
+# поэтому человек с правом читать Secret всё равно увидит пароль.
+# Пароль записан в файл открытым текстом, потому что это учебный
+# проект; в реальных проектах такие файлы не кладут в git.
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nextcloud-secret
+  labels:
+    app: nextcloud
+# Opaque: обычный секрет с произвольными ключами.
+type: Opaque
+# stringData: значения обычным текстом, Kubernetes сам переведёт их в base64.
+stringData:
+  # Пароль для входа в веб-интерфейс Nextcloud. Замени на свой.
+  NEXTCLOUD_ADMIN_PASSWORD: "Nc-Lab3-Change-Me"
+
+---
+# ----------------------------------------------------------------------------
+# 2. ConfigMap: несекретные настройки Nextcloud.
+#
+# По заданию эти переменные перенесены сюда из блока env у Deployment.
+# Так Deployment описывает только "что запустить", а настройки меняются
+# отдельно, без правки описания пода.
+#
+# Значения в ConfigMap всегда строки, поэтому '1' и 'yes' в кавычках.
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextcloud-configmap
+  labels:
+    app: nextcloud
+data:
+  # Разрешает образу обновить или установить Nextcloud при старте
+  # контейнера, даже если команда запуска изменена.
+  NEXTCLOUD_UPDATE: "1"
+
+  # Перенесена из исходного примера. Официальный образ nextcloud эту
+  # переменную не читает (она из образов другого поставщика, Bitnami),
+  # поэтому на работу она не влияет.
+  ALLOW_EMPTY_PASSWORD: "yes"
+
+  # Адрес базы данных: имя Service из pg_service.yml. Внутри кластера
+  # работает DNS, и это имя превращается в IP-адрес Service.
+  POSTGRES_HOST: "postgres-service"
+
+  # Адреса, по которым Nextcloud разрешает к себе обращаться. Запрос, в
+  # заголовке Host которого стоит другой адрес, Nextcloud отклоняет с
+  # ошибкой "Trusted domain error" (код 400). Адреса через пробел.
+  #   127.0.0.1  адрес, который открывает `minikube service nextcloud`
+  #              (на macOS и Windows с драйвером Docker это туннель на
+  #              127.0.0.1:<порт>, порт Nextcloud не учитывает);
+  #   localhost  нужен readinessProbe, см. ниже.
+  # Если в браузере откроется адрес вида 192.168.49.2:3xxxx (Linux), его
+  # надо добавить сюда же.
+  NEXTCLOUD_TRUSTED_DOMAINS: "127.0.0.1 localhost"
+
+  # Логин администратора, которого Nextcloud создаст при установке.
+  # Замени на свой. Пароль к нему в Secret nextcloud-secret.
+  NEXTCLOUD_ADMIN_USER: "lab3admin"
+
+---
+# ----------------------------------------------------------------------------
+# 3. Deployment: сам Nextcloud.
+#
+# Deployment описывает, какие поды запустить и сколько их держать.
+# Он создаёт ReplicaSet, а тот создаёт поды и пересоздаёт их, если они
+# пропали.
+# ----------------------------------------------------------------------------
+kind: Deployment
+# Deployment лежит в группе API apps.
+apiVersion: apps/v1
+metadata:
+  name: nextcloud
+  labels:
+    app: nextcloud
+spec:
+  replicas: 1
+  # По этим меткам Deployment находит свои поды. Должно совпадать с
+  # template.metadata.labels.
+  selector:
+    matchLabels:
+      app: nextcloud
+  # Шаблон пода.
+  template:
+    metadata:
+      labels:
+        # По этой метке под находит и Service, созданный kubectl expose.
+        app: nextcloud
+    spec:
+      containers:
+        - name: nextcloud
+          # Официальный образ Nextcloud: стабильная версия с веб-сервером Apache.
+          image: docker.io/nextcloud:stable-apache
+
+          # Ресурсы. requests: гарантированный минимум, по нему выбирается
+          # узел. limits: потолок; при превышении памяти контейнер
+          # убивается (OOMKilled). 500m = половина ядра. На практике
+          # Лимит памяти поднят с 256Mi из исходного примера до 1Gi.
+          # Сразу после установки Nextcloud занимает около 190 МиБ, но при
+          # первом входе он генерирует превью файлов, выходит за 256 МиБ, и
+          # контейнер убивается (OOMKilled, код 137). После такого
+          # перезапуска новый контейнер начинает установку заново, но база
+          # уже заполнена прошлой установкой, и установка падает с ошибкой
+          # "permission denied for table oc_migrations".
+          resources:
+            limits:
+              cpu: 500m
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 128Mi
+
+          # Порт веб-сервера Apache внутри контейнера. Имя http можно
+          # использовать в пробах и Service вместо номера.
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+
+          # envFrom: все ключи своих ConfigMap и Secret становятся
+          # переменными окружения с теми же именами. Это и есть перенос
+          # переменных из Deployment в ConfigMap по заданию: здесь
+          # больше не перечисляется каждая переменная Nextcloud.
+          envFrom:
+            # NEXTCLOUD_UPDATE, ALLOW_EMPTY_PASSWORD, POSTGRES_HOST,
+            # NEXTCLOUD_TRUSTED_DOMAINS, NEXTCLOUD_ADMIN_USER
+            - configMapRef:
+                name: nextcloud-configmap
+            # NEXTCLOUD_ADMIN_PASSWORD
+            - secretRef:
+                name: nextcloud-secret
+
+          # env: отдельные переменные из чужих объектов, объектов Postgres.
+          # Тут не используется envFrom, чтобы взять только нужные ключи,
+          # а не всё содержимое объекта: valueFrom берёт одно значение по
+          # имени объекта (name) и ключу (key). Nextcloud должен знать те
+          # же имя базы, логин и пароль, с которыми запущен Postgres,
+          # поэтому они читаются из тех же объектов, что и в pg_deployment.yml.
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-configmap
+                  key: POSTGRES_DB
+            # Логин и пароль теперь в Secret, поэтому secretKeyRef,
+            # а не configMapKeyRef, как было в исходном примере.
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+
+          imagePullPolicy: IfNotPresent
+
+          # ------------------------------------------------------------------
+          # ПРОБЫ (PROBES)
+          #
+          # Проба это проверка, которую kubelet (агент Kubernetes на узле)
+          # регулярно выполняет над контейнером. Варианты проверки:
+          #   httpGet    HTTP-запрос, успех при коде ответа 200-399;
+          #   tcpSocket  попытка открыть TCP-соединение с портом;
+          #   exec       команда внутри контейнера, успех при коде 0.
+          #
+          # Три вида проб отвечают на разные вопросы:
+          #
+          #   startupProbe    "Приложение уже запустилось?" Пока она не
+          #                   прошла, две другие пробы не выполняются.
+          #   livenessProbe   "Приложение живо или зависло?" Если проба
+          #                   проваливается несколько раз подряд, kubelet
+          #                   перезапускает контейнер.
+          #   readinessProbe  "Готово принимать запросы?" Если нет, под
+          #                   убирается из Service (запросы на него не
+          #                   идут), но контейнер НЕ перезапускается.
+          #
+          # Общие параметры:
+          #   periodSeconds     как часто проверять;
+          #   timeoutSeconds    сколько ждать ответа;
+          #   failureThreshold  сколько провалов подряд считать сбоем.
+          # ------------------------------------------------------------------
+
+          # startupProbe. При первом старте образ копирует файлы Nextcloud
+          # и устанавливает его в базу, и только потом запускает Apache.
+          # С лимитом в половину ядра это занимает от полуминуты до нескольких
+          # минут. Без startupProbe livenessProbe начала бы проверять
+          # сразу, не дождалась бы Apache и перезапускала бы контейнер
+          # посреди установки, бесконечно.
+          # Здесь даётся до 10 минут: 60 попыток раз в 10 секунд. Как
+          # только Apache открыл порт 80, проба проходит, и дальше
+          # работают две другие пробы.
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60
+
+          # livenessProbe: жив ли веб-сервер. Проверяется только, что порт
+          # 80 принимает соединения. Базу данных эта проба специально не
+          # затрагивает: если Postgres недоступен, перезапуск Nextcloud
+          # ничего не исправит, а только добавит перезапусков. Для такой
+          # ситуации есть readinessProbe.
+          # 3 провала подряд с интервалом 20 секунд (около минуты без
+          # ответа) означают, что Apache завис, и контейнер перезапускается.
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # readinessProbe: может ли Nextcloud обслуживать пользователей.
+          # Запрашивается /status.php, служебная страница Nextcloud. Она
+          # отвечает 200, только если Nextcloud установлен и смог
+          # прочитать свою базу. Если база недоступна или пуста, ответ
+          # 500, под помечается неготовым и Service перестаёт слать на
+          # него запросы.
+          #
+          # Заголовок Host. kubelet по умолчанию шлёт запрос на IP пода
+          # (например 10.244.0.5), и Nextcloud отвечает 400 "Trusted domain
+          # error", потому что такого адреса нет в
+          # NEXTCLOUD_TRUSTED_DOMAINS. Проба никогда бы не прошла. Поэтому
+          # в запрос подставлен заголовок Host: localhost, а localhost
+          # добавлен в NEXTCLOUD_TRUSTED_DOMAINS в ConfigMap выше.
+          readinessProbe:
+            httpGet:
+              path: /status.php
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+      # Always: перезапускать контейнер, если он завершился, с любым кодом.
+      # Для Deployment это единственное допустимое значение.
+      restartPolicy: Always
+      # ClusterFirst: DNS-запросы сначала идут в DNS кластера. Благодаря
+      # этому имя postgres-service превращается в IP-адрес Service.
+      dnsPolicy: ClusterFirst

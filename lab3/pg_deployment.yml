@@ -1,0 +1,121 @@
+# ============================================================================
+#  pg_deployment.yml: запуск самого PostgreSQL
+# ============================================================================
+#
+#  ЧТО ТАКОЕ МАНИФЕСТ
+#
+#  Манифест это YAML-файл с описанием объекта, который должен
+#  существовать в кластере Kubernetes. Kubernetes создаёт объект по
+#  этому описанию и дальше следит, чтобы реальность ему соответствовала.
+#  Отступы в YAML делаются пробелами и определяют вложенность.
+#
+#  POD, REPLICASET, DEPLOYMENT
+#
+#  Pod (под) это минимальная единица запуска в Kubernetes: один или
+#  несколько контейнеров с общим IP-адресом. Сам по себе под никто не
+#  восстанавливает: удалили или он упал вместе с узлом, и его нет.
+#
+#  Deployment описывает, какие поды нужны и сколько их должно быть.
+#  Deployment создаёт ReplicaSet, а ReplicaSet создаёт поды и постоянно
+#  сверяет: "нужно 1, работает 1". Если под исчез, ReplicaSet создаёт
+#  новый. Если поменять образ в Deployment, он плавно заменит старые
+#  поды новыми.
+#
+#    Deployment postgres --> ReplicaSet postgres-xxxx --> Pod postgres-xxxx-yyyy
+#
+#  ОТКУДА КОНТЕЙНЕР БЕРЁТ НАСТРОЙКИ
+#
+#  Официальный образ postgres при первом запуске читает переменные
+#  окружения POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD и создаёт базу
+#  и пользователя. Здесь эти переменные приходят из двух объектов:
+#    postgres-configmap (pg_configmap.yml)  POSTGRES_DB
+#    postgres-secret    (pg_secret.yml)     POSTGRES_USER, POSTGRES_PASSWORD
+#
+#  ВАЖНО: ДАННЫЕ НЕ СОХРАНЯЮТСЯ
+#
+#  У этого пода нет постоянного хранилища (PersistentVolume). Файлы базы
+#  лежат внутри контейнера и пропадают, когда под пересоздаётся. Для
+#  учебного примера это допустимо, в реальной системе базе нужен
+#  PersistentVolumeClaim. К чему это приводит, разобрано в README в
+#  ответе на вопрос про масштабирование до 0.
+#
+#  КОМАНДЫ
+#
+#    kubectl create -f pg_deployment.yml
+#    kubectl get deployment                      READY 1/1, когда под готов
+#    kubectl get pods                            имя пода вида postgres-xxxx-yyyy
+#    kubectl describe deployment/postgres
+#    kubectl logs deployment/postgres            логи Postgres
+# ============================================================================
+
+# Deployment лежит не в базовой группе v1, а в группе apps.
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: postgres
+
+spec:
+  # Сколько одинаковых подов держать запущенными. Для базы без общего
+  # хранилища больше одной копии не имеет смысла: у каждой была бы своя,
+  # отдельная база.
+  replicas: 1
+
+  # selector: по каким меткам Deployment узнаёт "свои" поды. Должен
+  # совпадать с метками в template.metadata.labels ниже, иначе Kubernetes
+  # откажется создавать Deployment.
+  selector:
+    matchLabels:
+      app: postgres
+
+  # template: шаблон пода. Всё, что ниже, это описание пода, который
+  # Deployment будет создавать.
+  template:
+    metadata:
+      # Метки пода. По ним под находят и Deployment (selector выше), и
+      # Service postgres-service (pg_service.yml).
+      labels:
+        app: postgres
+
+    spec:
+      containers:
+        - name: postgres-container
+          # Образ с Docker Hub. Версия указана явно (14), чтобы при
+          # следующем запуске не приехала другая мажорная версия.
+          image: postgres:14
+
+          # Ресурсы контейнера.
+          #   requests: сколько ресурсов гарантированно зарезервировать.
+          #             По requests планировщик выбирает узел, где хватит места.
+          #   limits:   верхняя граница. CPU сверх лимита урезается
+          #             (контейнер работает медленнее), при превышении
+          #             памяти контейнер убивается (OOMKilled).
+          #   cpu: 100m значит 100 милликор, то есть 0.1 ядра.
+          #   memory: 128Mi значит 128 мебибайт.
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+
+          # IfNotPresent: скачивать образ, только если его ещё нет на узле.
+          imagePullPolicy: "IfNotPresent"
+
+          # Порт, который слушает Postgres внутри контейнера. Это
+          # описание для людей и инструментов: сам порт открывает Postgres,
+          # а снаружи его делает доступным Service.
+          ports:
+            - containerPort: 5432
+
+          # envFrom: взять ВСЕ ключи объекта и сделать каждый переменной
+          # окружения с тем же именем. Источников может быть несколько.
+          envFrom:
+            # POSTGRES_DB
+            - configMapRef:
+                name: postgres-configmap
+            # POSTGRES_USER и POSTGRES_PASSWORD. Это изменение по заданию:
+            # раньше здесь была только ссылка на ConfigMap.
+            - secretRef:
+                name: postgres-secret
