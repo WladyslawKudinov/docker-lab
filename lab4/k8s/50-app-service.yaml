@@ -1,0 +1,62 @@
+# ============================================================================
+#  50-app-service.yaml: постоянный внутренний адрес приложения lab4-app.
+#
+#  Манифест это описание объекта для Kubernetes. Поля apiVersion (версия
+#  API), kind (тип объекта), metadata (имя, namespace, метки) есть у
+#  каждого манифеста, spec описывает, что именно нужно. Применяется:
+#      kubectl apply -f k8s/50-app-service.yaml
+#
+#  ЗАЧЕМ НУЖЕН SERVICE
+#
+#  У каждого пода есть свой IP-адрес, но он меняется при каждом
+#  пересоздании пода. Обращаться к поду по IP нельзя: завтра там будет
+#  другой адрес. Service даёт постоянное имя и адрес и сам пересылает
+#  запросы на подходящие поды, сейчас работающие и готовые.
+#
+#  Какие поды подходящие, решает selector: все поды с меткой
+#  app.kubernetes.io/name=lab4-app. Такую метку ставит шаблон пода в
+#  k8s/40-app-deployment.yaml. Пока под не прошёл readinessProbe, Service
+#  его пропускает.
+#
+#  Внутри кластера Service доступен по DNS-имени, которое Kubernetes
+#  создаёт автоматически:
+#      lab4-app                         из того же namespace lab4
+#      lab4-app.lab4.svc.cluster.local  полное имя, откуда угодно
+#  Nginx (k8s/60-proxy-configmap.yaml) пересылает запросы на
+#  http://lab4-app:5000. Это та же роль, что у имени контейнера в сети
+#  docker compose.
+#
+#  Проверка:
+#      kubectl get svc -n lab4                 тип ClusterIP, порт 5000
+#      kubectl get endpoints lab4-app -n lab4  IP пода, на который идут
+#                                              запросы (пусто, если под
+#                                              не готов)
+# ============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  # Имя Service и есть DNS-имя, по которому к нему обращаются.
+  name: lab4-app
+  namespace: lab4
+  # Метки для поиска и группировки, Kubernetes по ним сам ничего не делает.
+  labels:
+    app.kubernetes.io/name: lab4-app
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: lab4-counter
+spec:
+  # type: ClusterIP (значение по умолчанию) значит, что адрес доступен
+  # только внутри кластера. Снаружи к приложению напрямую не попасть, только
+  # через nginx. Так же было в ЛР 2: порт приложения не пробрасывался
+  # наружу.
+  type: ClusterIP
+  # На какие поды пересылать запросы: по метке.
+  selector:
+    app.kubernetes.io/name: lab4-app
+  ports:
+    - name: http
+      # port: порт самого Service, на него обращаются клиенты.
+      port: 5000
+      # targetPort: порт в контейнере пода, куда переслать запрос.
+      # Указано имя порта http из Deployment, а не число. Если приложение
+      # переедет на другой порт, достаточно поменять Deployment.
+      targetPort: http

@@ -1,0 +1,77 @@
+# ============================================================================
+#  60-proxy-configmap.yaml: файл настроек nginx, который подключается в
+#  под прокси.
+#
+#  Манифест это описание объекта для Kubernetes. Поля apiVersion (версия
+#  API), kind (тип объекта), metadata (имя, namespace, метки) есть у
+#  каждого манифеста. Применяется:
+#      kubectl apply -f k8s/60-proxy-configmap.yaml
+#
+#  CONFIGMAP КАК ФАЙЛ
+#
+#  ConfigMap хранит пары "ключ: значение". Его можно подключить в под не
+#  только как переменные окружения, но и как том: тогда каждый ключ
+#  становится файлом, а значение его содержимым. Здесь один ключ
+#  default.conf. В k8s/70-proxy-deployment.yaml этот ConfigMap подключён в
+#  папку /etc/nginx/conf.d, и nginx видит файл
+#  /etc/nginx/conf.d/default.conf.
+#
+#  Так меняют настройки публичного образа, не собирая свой: nginx:1.27-alpine
+#  берётся как есть, а настройки приходят из кластера. В ЛР 2 для этого
+#  служил bind mount файла с компьютера.
+#
+#  Подключённые как том ConfigMap Kubernetes обновляет в поде сам (с
+#  задержкой до минуты), но nginx читает настройки только при старте.
+#  После правки:
+#      kubectl apply -f k8s/60-proxy-configmap.yaml
+#      kubectl rollout restart deployment/lab4-proxy -n lab4
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lab4-proxy-config
+  namespace: lab4
+  # Метки для поиска и группировки, Kubernetes по ним сам ничего не делает.
+  labels:
+    app.kubernetes.io/name: lab4-proxy
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/part-of: lab4-counter
+data:
+  # `|` в YAML значит "дальше многострочный текст, переносы строк
+  # сохранить". Всё, что с отступом ниже, это содержимое файла
+  # default.conf. Комментарии внутри него начинаются с # и относятся уже
+  # к nginx.
+  default.conf: |
+    server {
+        # Слушать порт 80 внутри контейнера.
+        listen 80;
+
+        # Собственная проверка nginx для livenessProbe. Отвечает сам nginx,
+        # без обращения к приложению. Если бы liveness ходила в приложение,
+        # то при падении приложения Kubernetes перезапускал бы ещё и
+        # исправный nginx, что ничего не чинит.
+        location = /nginx-health {
+            access_log off;
+            return 200 "ok\n";
+        }
+
+        # Все остальные запросы переслать приложению.
+        # lab4-app это DNS-имя Service из k8s/50-app-service.yaml,
+        # 5000 его порт. Service сам выберет готовый под приложения.
+        #
+        # nginx ищет адрес по имени один раз, при старте. Если Service
+        # lab4-app ещё не создан, nginx завершится с ошибкой "host not
+        # found in upstream" (под уйдёт в CrashLoopBackOff). Поэтому
+        # Service приложения применяется раньше (файл 50 идёт до 70).
+        # Адрес Service постоянный, так что удаление и пересоздание
+        # подов приложения nginx не мешает.
+        location / {
+            proxy_pass http://lab4-app:5000;
+
+            # Передать приложению исходное имя сайта и адрес клиента. Без
+            # этого приложение видит, что все запросы пришли от nginx.
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+    }

@@ -1,0 +1,271 @@
+# ============================================================================
+#  40-app-deployment.yaml: приложение-счётчик. Под из init-контейнера и
+#  основного контейнера, оба из собственного образа lab4-app:1.0.
+#
+#  Манифест это описание объекта для Kubernetes. Поля apiVersion (версия
+#  API), kind (тип объекта), metadata (имя, namespace, метки) есть у
+#  каждого манифеста, spec описывает, что именно нужно. Применяется:
+#      kubectl apply -f k8s/40-app-deployment.yaml
+#
+#  ЧТО ТАКОЕ DEPLOYMENT
+#
+#  Сам по себе под Kubernetes не восстанавливает: удалили или он упал
+#  вместе с узлом, и его больше нет. Deployment следит за подами за нас.
+#  В нём записано "должен работать 1 под вот по такому шаблону", и
+#  Kubernetes постоянно сверяет это с реальностью: пода нет, значит
+#  создать; шаблон поменялся, значит заменить старые поды новыми.
+#
+#  Цепочка объектов:  Deployment -> ReplicaSet -> Pod
+#  ReplicaSet создаётся автоматически и держит нужное число подов одной
+#  версии шаблона. При обновлении Deployment создаёт новый ReplicaSet.
+#
+#  ЧТО ПРОИСХОДИТ ПРИ ЗАПУСКЕ ПОДА
+#
+#    1. Kubernetes подключает к поду том lab4-data (PVC из k8s/30-pvc.yaml).
+#    2. Запускается init-контейнер init-counter. Он кладёт в /data файл
+#       счётчика с начальным значением, если файла ещё нет, и завершается.
+#    3. Только после его успешного завершения (код 0) запускается основной
+#       контейнер app. Если init упал, Kubernetes перезапускает его, а app
+#       не стартует вовсе.
+#    4. Kubernetes начинает проверять app пробами. Пока readinessProbe не
+#       прошла, Service не отправляет поду запросы.
+#
+#  Это то же, что связка init + app в docker compose из ЛР 2, но
+#  init-контейнер живёт внутри пода приложения, а не отдельным сервисом.
+#
+#  Проверка:
+#      kubectl get pods -n lab4 -l app.kubernetes.io/name=lab4-app
+#          READY 1/1, STATUS Running
+#      kubectl logs -n lab4 deploy/lab4-app -c init-counter
+#          init: counter created, value 100
+#      kubectl describe pod -n lab4 -l app.kubernetes.io/name=lab4-app
+#          разделы Init Containers, Containers, Volumes, Events
+# ============================================================================
+# apps/v1: Deployment относится к группе API "apps", а не к базовой "v1",
+# как Pod или Service.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lab4-app
+  namespace: lab4
+  # Метки самого Deployment. Нужны для поиска, Kubernetes по ним ничего
+  # не решает:
+  #   name       приложение
+  #   component  роль в системе: backend, то есть сервис за прокси
+  #   part-of    система в целом
+  #   version    версия приложения
+  labels:
+    app.kubernetes.io/name: lab4-app
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: lab4-counter
+    app.kubernetes.io/version: "1.0"
+spec:
+  # replicas: сколько одинаковых подов держать. Ровно один, потому что
+  # счётчик хранится в файле на томе ReadWriteOnce. Два пода могли бы
+  # писать в файл одновременно и терять значения (и том ReadWriteOnce
+  # не подключится к подам на разных узлах).
+  replicas: 1
+
+  # strategy: как заменять поды при обновлении.
+  #   RollingUpdate (по умолчанию)  сначала запустить новый под, потом
+  #                                 удалить старый. Какое-то время работают
+  #                                 оба и оба пишут в один файл.
+  #   Recreate                      сначала удалить старый, потом запустить
+  #                                 новый. Короткий простой, зато к тому
+  #                                 никогда не подключены два пода сразу.
+  # Для приложения с одним писателем в файл правильный выбор Recreate.
+  strategy:
+    type: Recreate
+
+  # selector: по каким меткам Deployment узнаёт "свои" поды. Должен
+  # совпадать с метками в template ниже, иначе Kubernetes не примет
+  # манифест. Метка name не меняется между версиями, поэтому выбрана она.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lab4-app
+
+  # template: шаблон пода. Всё, что ниже, описывает под, который
+  # Deployment будет создавать.
+  template:
+    metadata:
+      # Метки, которые получит каждый под. По метке name его находят
+      # selector этого Deployment и Service (k8s/50-app-service.yaml).
+      # Остальные для людей: например, показать все поды бэкенда:
+      #     kubectl get pods -n lab4 -l app.kubernetes.io/component=backend
+      labels:
+        app.kubernetes.io/name: lab4-app
+        app.kubernetes.io/component: backend
+        app.kubernetes.io/part-of: lab4-counter
+        app.kubernetes.io/version: "1.0"
+    spec:
+      # securityContext на уровне пода: настройки безопасности для всех
+      # его контейнеров.
+      #   runAsNonRoot: true  отказаться запускать контейнер, если он
+      #                       будет работать от root (номер пользователя 0).
+      #                       Образ запускается от пользователя 1001
+      #                       (строка USER 1001 в Dockerfile), проверка
+      #                       проходит.
+      #   runAsUser: 1001     явно запускать процессы от пользователя 1001
+      #   fsGroup: 1001       сделать группу 1001 владельцем файлов на
+      #                       подключённых томах. Без этого новый диск
+      #                       может принадлежать root, и пользователь 1001
+      #                       не смог бы записать в него счётчик.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+
+      # volumes: какие тома доступны этому поду. Здесь объявляется том и
+      # его источник, а в какую папку его подключить, указывает каждый
+      # контейнер в своём volumeMounts.
+      volumes:
+        - name: counter-data
+          # Источник тома: PVC lab4-data из k8s/30-pvc.yaml. Данные лежат
+          # на диске, который живёт дольше пода.
+          persistentVolumeClaim:
+            claimName: lab4-data
+
+      # initContainers: контейнеры, которые выполняются ДО основных, по
+      # очереди, и каждый должен завершиться успешно. Подходят для
+      # подготовки: создать файлы, дождаться базы данных, применить
+      # миграции.
+      initContainers:
+        - name: init-counter
+          # Тот же собственный образ, что у основного контейнера: в нём
+          # уже есть оболочка sh и пользователь 1001. Отдельный образ ради
+          # одного скрипта не нужен.
+          image: lab4-app:1.0
+          # imagePullPolicy: когда скачивать образ из реестра.
+          #   IfNotPresent  брать образ, который уже есть на узле, и
+          #                 скачивать, только если его нет.
+          # Образ lab4-app:1.0 собран прямо в Minikube и нигде не
+          # опубликован, скачать его неоткуда. Он уже лежит на узле, поэтому
+          # IfNotPresent берёт его оттуда. С политикой Always Kubernetes
+          # попытался бы скачать его с Docker Hub и выдал ErrImagePull.
+          imagePullPolicy: IfNotPresent
+          # command заменяет CMD из Dockerfile: вместо сервера gunicorn
+          # выполнится скрипт в оболочке sh. `-c` значит "выполни текст,
+          # который идёт следующим аргументом".
+          #
+          # Что делает скрипт:
+          #   if [ -f файл ]      если файл счётчика уже существует (под
+          #                       перезапускается не впервые), только
+          #                       сообщить текущее значение;
+          #   else echo N > файл  иначе записать в него COUNTER_START.
+          #
+          # Переменные $DATA_DIR и $COUNTER_START подставляет оболочка sh
+          # из окружения контейнера, а в окружение они пришли из ConfigMap
+          # (envFrom ниже).
+          #
+          # `|` в YAML значит "дальше многострочный текст, сохранить
+          # переносы строк как есть".
+          command:
+            - /bin/sh
+            - -c
+            - |
+              if [ -f "$DATA_DIR/counter.txt" ]; then
+                echo "init: counter already exists, value $(cat "$DATA_DIR/counter.txt")"
+              else
+                echo "$COUNTER_START" > "$DATA_DIR/counter.txt"
+                echo "init: counter created, value $COUNTER_START"
+              fi
+          # envFrom + configMapRef: превратить все ключи ConfigMap
+          # lab4-app-config (k8s/10-configmap.yaml) в переменные окружения.
+          envFrom:
+            - configMapRef:
+                name: lab4-app-config
+          # Подключить том counter-data (объявлен выше в volumes) в /data.
+          volumeMounts:
+            - name: counter-data
+              mountPath: /data
+          # Сколько ресурсов выделить. Пояснения ниже, у контейнера app.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+
+      # containers: основные контейнеры пода. Здесь один, само приложение.
+      containers:
+        - name: app
+          image: lab4-app:1.0
+          imagePullPolicy: IfNotPresent
+          # Порт, который слушает приложение. Как EXPOSE в Dockerfile, это
+          # описание, а не открытие порта. name: http даёт порту имя, на
+          # которое ссылаются пробы ниже и Service (targetPort: http).
+          ports:
+            - name: http
+              containerPort: 5000
+          # Обычные настройки целиком из ConfigMap.
+          envFrom:
+            - configMapRef:
+                name: lab4-app-config
+          # Секретная настройка: один ключ из Secret (k8s/20-secret.yaml)
+          # в переменную RESET_TOKEN. Можно было бы и тут написать envFrom
+          # с secretRef, но точечное подключение нагляднее: видно, какой
+          # именно секрет получает контейнер.
+          env:
+            - name: RESET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: lab4-app-secret
+                  key: RESET_TOKEN
+          volumeMounts:
+            - name: counter-data
+              mountPath: /data
+
+          # resources: ресурсы контейнера. Аналог deploy.resources в
+          # docker compose.
+          #   requests  сколько гарантированно зарезервировать. По этому
+          #             числу планировщик выбирает узел, где хватит места.
+          #   limits    верхняя граница. При превышении памяти контейнер
+          #             убивается (OOMKilled), CPU просто притормаживается.
+          #   cpu: 100m   100 милли-ядер, то есть 0.1 ядра
+          #   memory: 128Mi  128 мебибайт
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+
+          # ПРОБЫ: как Kubernetes проверяет контейнер. Обе пробы делают
+          # HTTP-запрос GET /health на порт http. Ответ с кодом 200-399
+          # значит проверка прошла, ошибка или нет ответа значит провалена.
+          #
+          # readinessProbe: готов ли контейнер принимать запросы. Пока не
+          # готов, Service не отправляет на этот под трафик, но контейнер
+          # не трогает. Нужна, чтобы запросы не шли в приложение, которое
+          # ещё запускается или временно не справляется.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            # Подождать 2 секунды после старта перед первой проверкой.
+            initialDelaySeconds: 2
+            # Проверять каждые 5 секунд.
+            periodSeconds: 5
+            # Ждать ответа не дольше 2 секунд.
+            timeoutSeconds: 2
+            # После 3 провалов подряд считать под неготовым.
+            failureThreshold: 3
+
+          # livenessProbe: жив ли контейнер. Если проверка проваливается
+          # failureThreshold раз подряд, Kubernetes считает приложение
+          # зависшим и ПЕРЕЗАПУСКАЕТ контейнер. Счётчик перезапусков виден
+          # в колонке RESTARTS у `kubectl get pods`.
+          #
+          # Проверка начинается позже и допускает больше провалов, чем
+          # readiness: перезапуск это крайняя мера, и медленный старт не
+          # должен к нему приводить.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3

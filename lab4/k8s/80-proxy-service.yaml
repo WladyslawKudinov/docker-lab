@@ -1,0 +1,59 @@
+# ============================================================================
+#  80-proxy-service.yaml: вход в систему снаружи кластера, через nginx.
+#
+#  Манифест это описание объекта для Kubernetes. Поля apiVersion (версия
+#  API), kind (тип объекта), metadata (имя, namespace, метки) есть у
+#  каждого манифеста, spec описывает, что именно нужно. Применяется:
+#      kubectl apply -f k8s/80-proxy-service.yaml
+#
+#  Service даёт постоянный адрес группе подов (у самих подов IP меняется
+#  при пересоздании) и делит запросы между ними. Какие поды входят в
+#  группу, задаёт selector по меткам: здесь это оба пода nginx из
+#  k8s/70-proxy-deployment.yaml.
+#
+#  ТИП NODEPORT
+#
+#  Service типа ClusterIP (как lab4-app) доступен только изнутри кластера.
+#  NodePort дополнительно открывает порт на каждом узле кластера. Запрос на
+#  <IP узла>:30080 попадает в Service, а оттуда в один из подов nginx.
+#  Это аналог `ports: "8080:80"` в docker compose.
+#
+#  КАК ОТКРЫТЬ ИЗ MINIKUBE
+#
+#  Узел Minikube это виртуальная машина или контейнер, его IP показывает
+#  `minikube ip`. На Linux можно сразу:
+#      curl http://$(minikube ip):30080/
+#  На macOS и Windows с драйвером docker IP узла с компьютера недоступен.
+#  Тогда Minikube открывает туннель сам:
+#      minikube service lab4-proxy -n lab4 --url
+#  Команда печатает адрес вида http://127.0.0.1:54321 и держит туннель,
+#  пока не закрыть терминал. Запросы делать из второго окна терминала.
+#
+#  Проверка:
+#      kubectl get svc lab4-proxy -n lab4   TYPE NodePort, PORT(S) 80:30080/TCP
+# ============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: lab4-proxy
+  namespace: lab4
+  # Метки для поиска и группировки, Kubernetes по ним сам ничего не делает.
+  labels:
+    app.kubernetes.io/name: lab4-proxy
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/part-of: lab4-counter
+spec:
+  type: NodePort
+  # Поды с этой меткой получают запросы.
+  selector:
+    app.kubernetes.io/name: lab4-proxy
+  ports:
+    - name: http
+      # port: порт Service внутри кластера.
+      port: 80
+      # targetPort: порт контейнера nginx (по имени из Deployment).
+      targetPort: http
+      # nodePort: порт на узле. Допустимый диапазон 30000-32767. Если не
+      # указать, Kubernetes выберет случайный; фиксированный удобнее
+      # запоминать и вписывать в команды.
+      nodePort: 30080

@@ -1,0 +1,122 @@
+# ============================================================================
+#  70-proxy-deployment.yaml: nginx перед приложением, два одинаковых пода.
+#
+#  Манифест это описание объекта для Kubernetes. Поля apiVersion (версия
+#  API), kind (тип объекта), metadata (имя, namespace, метки) есть у
+#  каждого манифеста, spec описывает, что именно нужно. Применяется:
+#      kubectl apply -f k8s/70-proxy-deployment.yaml
+#
+#  Deployment следит, чтобы всегда работало заданное число подов по
+#  шаблону: под удалили или он упал, Deployment создаёт новый.
+#
+#  Что делает: принимает запросы снаружи (через Service lab4-proxy,
+#  k8s/80-proxy-service.yaml) и пересылает их приложению по адресу
+#  http://lab4-app:5000. Настройки nginx приходят из ConfigMap
+#  lab4-proxy-config (k8s/60-proxy-configmap.yaml), подключённого как том.
+#
+#  Образ публичный, nginx:1.27-alpine с Docker Hub. Собственный образ здесь
+#  не нужен: всё, что отличает наш nginx, лежит в файле настроек.
+#
+#  Проверка:
+#      kubectl get pods -n lab4 -l app.kubernetes.io/name=lab4-proxy
+#          два пода, READY 1/1
+#      kubectl exec -n lab4 deploy/lab4-proxy -- cat /etc/nginx/conf.d/default.conf
+#          содержимое файла из ConfigMap
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lab4-proxy
+  namespace: lab4
+  # Метки для поиска и группировки, Kubernetes по ним сам ничего не делает:
+  #   name       приложение
+  #   component  роль: прокси перед бэкендом
+  #   part-of    система в целом
+  labels:
+    app.kubernetes.io/name: lab4-proxy
+    app.kubernetes.io/component: proxy
+    app.kubernetes.io/part-of: lab4-counter
+spec:
+  # Два пода. У nginx нет своих данных, все копии одинаковые, поэтому их
+  # можно запускать сколько угодно. Service делит запросы между ними, а если
+  # один под упадёт, второй продолжит отвечать.
+  #     kubectl scale deployment/lab4-proxy -n lab4 --replicas=3
+  # поменяет число подов на лету.
+  replicas: 2
+
+  # По метке name Deployment находит свои поды. Должна совпадать с
+  # метками шаблона ниже.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lab4-proxy
+
+  # Шаблон пода.
+  template:
+    metadata:
+      # Метки пода. По name его находят этот Deployment и Service
+      # lab4-proxy.
+      labels:
+        app.kubernetes.io/name: lab4-proxy
+        app.kubernetes.io/component: proxy
+        app.kubernetes.io/part-of: lab4-counter
+    spec:
+      # Том из ConfigMap: каждый ключ ConfigMap становится файлом.
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: lab4-proxy-config
+
+      containers:
+        - name: nginx
+          # Конкретная версия, а не latest: через месяц запустится тот же
+          # nginx, что сегодня.
+          image: nginx:1.27-alpine
+          # IfNotPresent: скачать с Docker Hub один раз, дальше брать с узла.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          # Подключить ConfigMap в /etc/nginx/conf.d. Вся папка заменяется
+          # содержимым ConfigMap, то есть одним файлом default.conf. Файл
+          # настроек, который лежал там в образе, не виден.
+          # readOnly: true, потому что nginx настройки только читает.
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+          # requests: сколько ресурсов зарезервировать, limits: максимум.
+          # 50m это 0.05 ядра, Mi это мебибайты. Nginx почти ничего не
+          # потребляет.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+
+          # readinessProbe: готов ли под принимать трафик. Проверка идёт
+          # через nginx до приложения (/health пересылается в lab4-app).
+          # Если приложение недоступно, этот под честно не получает запросов
+          # вместо того, чтобы отвечать клиентам ошибкой 502.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # livenessProbe: жив ли сам nginx. Проверяется адрес
+          # /nginx-health, на который отвечает nginx без приложения. При
+          # трёх провалах подряд Kubernetes перезапустит контейнер. От
+          # состояния приложения эта проверка не зависит: перезапуск nginx
+          # не починил бы упавшее приложение.
+          livenessProbe:
+            httpGet:
+              path: /nginx-health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
